@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>ChromeTop Agent</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0b0f17;
+      color: #e2e8f0;
+      width: 290px;
+      padding: 12px;
+      margin: 0;
+    }
+    h3 { margin: 0 0 10px 0; color: #00e5ff; font-size: 14px; }
+    label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      background: #161e2e;
+      color: #f8fafc;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 6px 8px;
+      margin-bottom: 10px;
+      font-size: 12px;
+    }
+    button {
+      width: 100%;
+      background: #00e5ff;
+      color: #0b0f17;
+      border: none;
+      border-radius: 6px;
+      padding: 8px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    #msg { margin-top: 8px; font-size: 12px; color: #00ff9c; }
+  </style>
+</head>
+<body>
+  <h3>⚡ ChromeTop Agent</h3>
+  <label for="wsEndpoint">WebSocket URL</label>
+  <input id="wsEndpoint" type="text" placeholder="ws://127.0.0.1:9333/ws" />
+  <label for="authToken">Auth Token (Optional)</label>
+  <input id="authToken" type="password" placeholder="Optional token" />
+  <button id="saveBtn">Save & Reconnect</button>
+  <div id="msg"></div>
+  <script>
+    const epEl = document.getElementById("wsEndpoint");
+    const tokEl = document.getElementById("authToken");
+    const msgEl = document.getElementById("msg");
+
+    chrome.storage.local.get(["wsEndpoint", "authToken"], (data) => {
+      epEl.value = data.wsEndpoint || "ws://127.0.0.1:9333/ws";
+      tokEl.value = data.authToken || "";
+    });
+
+    document.getElementById("saveBtn").addEventListener("click", () => {
+      chrome.storage.local.set({
+        wsEndpoint: epEl.value.trim() || "ws://127.0.0.1:9333/ws",
+        authToken: tokEl.value.trim()
+      }, () => {
+        msgEl.textContent = "Saved. Restarting worker...";
+        setTimeout(() => chrome.runtime.reload(), 300);
+      });
+    });
+  </script>
+</body>
+</html>

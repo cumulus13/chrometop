@@ -1,0 +1,18 @@
+# Binaries & build artifacts
+chrometop
+chrometop.exe
+dist/
+*.out
+*.test
+
+# Go workspace & vendor
+vendor/
+go.work.sum
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
