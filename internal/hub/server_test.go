@@ -1,7 +1,6 @@
 package hub
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +13,7 @@ import (
 )
 
 func TestWebSocketTelemetryAndCommand(t *testing.T) {
-	updated := make(chan struct{}, 8)
+	updated := make(chan struct{}, 32)
 	srv := New("secret-tok", func() {
 		select {
 		case updated <- struct{}{}:
@@ -36,14 +35,17 @@ func TestWebSocketTelemetryAndCommand(t *testing.T) {
 		Type:   "TELEMETRY",
 		SentAt: time.Now().UnixMilli(),
 		Summary: protocol.Summary{
+			Mode:           "EXTENSION",
 			TotalTabs:      2,
 			TotalWindows:   1,
+			TotalCPUPerc:   18.4,
+			TotalNetRate:   20480,
 			TotalJSHeapMB:  42.5,
 			EstimatedTotal: 110.0,
 		},
 		Tabs: []protocol.TabInfo{
-			{ID: 10, WindowID: 1, Title: "Example Domain", URL: "https://example.com", EstimatedMB: 60.0, JSHeapUsedMB: 22.5},
-			{ID: 11, WindowID: 1, Title: "GitHub", URL: "https://github.com", EstimatedMB: 50.0, JSHeapUsedMB: 20.0},
+			{ID: 10, WindowID: 1, Title: "Example Domain", URL: "https://example.com", CPUPercent: 12.1, NetBytesPerSec: 16384, EstimatedMB: 60.0, JSHeapUsedMB: 22.5},
+			{ID: 11, WindowID: 1, Title: "GitHub", URL: "https://github.com", CPUPercent: 6.3, NetBytesPerSec: 4096, EstimatedMB: 50.0, JSHeapUsedMB: 20.0},
 		},
 	}
 
@@ -55,13 +57,19 @@ func TestWebSocketTelemetryAndCommand(t *testing.T) {
 		t.Fatalf("write telemetry: %v", err)
 	}
 
-	select {
-	case <-updated:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for hub state update")
+	deadline := time.Now().Add(2 * time.Second)
+	var snap protocol.Snapshot
+	for time.Now().Before(deadline) {
+		snap = srv.Snapshot()
+		if len(snap.Tabs) == 2 && snap.Summary.TotalJSHeapMB == 42.5 {
+			break
+		}
+		select {
+		case <-updated:
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 
-	snap := srv.Snapshot()
 	if !snap.Connected {
 		t.Fatal("expected hub to report connected=true")
 	}
@@ -92,8 +100,6 @@ func TestWebSocketTelemetryAndCommand(t *testing.T) {
 	if got.Action != "RELOAD" || got.TabID != 10 {
 		t.Fatalf("unexpected command received: %+v", got)
 	}
-
-	_ = context.Background()
 }
 
 func TestUnauthorizedTokenRejected(t *testing.T) {

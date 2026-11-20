@@ -1,10 +1,12 @@
 {
   "manifest_version": 3,
   "name": "ChromeTop WebSocket Agent",
-  "version": "1.1.0",
-  "description": "Streams real-time Chrome tab telemetry, JS heap stats, and executes tab commands over WebSocket for the ChromeTop Go TUI.",
+  "version": "1.2.0",
+  "description": "Streams real-time Chromium/Chrome/Brave tab telemetry (CPU, Network, JS Heap, Memory) over WebSocket to ChromeTop.",
   "permissions": [
     "tabs",
+    "processes",
+    "webRequest",
     "alarms",
     "storage"
   ],

@@ -5,7 +5,12 @@ const RETRY_DELAY_MS = 2000;
 let ws = null;
 let pushTimer = null;
 let retryTimer = null;
+let lastTelemetryTime = Date.now();
+
 const pageMetricsCache = new Map();
+const nativeProcessMap = new Map();
+const tabNetworkBytes = new Map();
+const tabPrevNetSnapshot = new Map();
 
 async function readSettings() {
   const data = await chrome.storage.local.get(["wsEndpoint", "authToken"]);
@@ -21,25 +26,86 @@ function makeSocketURL(endpoint, token) {
   return `${endpoint}${sep}token=${encodeURIComponent(token)}`;
 }
 
+// Native chrome.processes listener (active on Chromium Dev/Canary or enterprise-enabled builds)
+function initNativeProcessMonitor() {
+  if (chrome.processes && chrome.processes.onUpdatedWithMemory) {
+    chrome.processes.onUpdatedWithMemory.addListener((processes) => {
+      nativeProcessMap.clear();
+      for (const proc of Object.values(processes)) {
+        if (!Array.isArray(proc.tasks)) continue;
+        for (const task of proc.tasks) {
+          if (typeof task.tabId === "number" && task.tabId >= 0) {
+            nativeProcessMap.set(task.tabId, {
+              processId: proc.osProcessId || proc.id || 0,
+              cpuPercent: typeof proc.cpu === "number" ? Number(proc.cpu.toFixed(1)) : 0,
+              memoryBytes: proc.privateMemory || proc.jsMemoryUsed || 0,
+              networkBytesPerSec: typeof proc.network === "number" ? proc.network : 0
+            });
+          }
+        }
+      }
+    });
+  }
+}
+
+// Per-tab network byte counter via webRequest headers
+if (chrome.webRequest && chrome.webRequest.onCompleted) {
+  chrome.webRequest.onCompleted.addListener(
+    (details) => {
+      if (typeof details.tabId !== "number" || details.tabId < 0) return;
+      let bytes = 0;
+      if (Array.isArray(details.responseHeaders)) {
+        for (const h of details.responseHeaders) {
+          if (h.name && h.name.toLowerCase() === "content-length" && h.value) {
+            const parsed = parseInt(h.value, 10);
+            if (!Number.isNaN(parsed) && parsed > 0) {
+              bytes = parsed;
+            }
+            break;
+          }
+        }
+      }
+      if (bytes === 0) bytes = 2048; // Minimum header/frame overhead estimate
+      tabNetworkBytes.set(details.tabId, (tabNetworkBytes.get(details.tabId) || 0) + bytes);
+    },
+    { urls: ["<all_urls>"] },
+    ["responseHeaders"]
+  );
+}
+
 async function queryPageMetrics(tab) {
+  const cached = pageMetricsCache.get(tab.id) || {
+    cpuPercent: 0,
+    jsHeapUsedMb: 0,
+    jsHeapTotalMb: 0,
+    resourceTransferBytes: 0,
+    domNodes: 0
+  };
+
   if (tab.discarded || !tab.url || (!tab.url.startsWith("http://") && !tab.url.startsWith("https://"))) {
-    return pageMetricsCache.get(tab.id) || { jsHeapUsedMb: 0, jsHeapTotalMb: 0, domNodes: 0 };
+    return cached;
   }
 
   try {
-    const res = await chrome.tabs.sendMessage(tab.id, { type: "GET_PAGE_METRICS" });
+    const res = await Promise.race([
+      chrome.tabs.sendMessage(tab.id, { type: "GET_PAGE_METRICS" }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 250))
+    ]);
     if (res && typeof res.jsHeapUsedMb === "number") {
       pageMetricsCache.set(tab.id, res);
       return res;
     }
   } catch {
-    // Content script may not be injected yet on restricted or freshly opened pages
+    // Content script unavailable or timed out on busy/restricted page
   }
 
-  return pageMetricsCache.get(tab.id) || { jsHeapUsedMb: 0, jsHeapTotalMb: 0, domNodes: 0 };
+  return cached;
 }
 
-function estimateTabFootprintMB(tab, heapUsedMB) {
+function estimateTabFootprintMB(tab, heapUsedMB, nativeMemBytes) {
+  if (nativeMemBytes && nativeMemBytes > 0) {
+    return Number((nativeMemBytes / (1024 * 1024)).toFixed(1));
+  }
   if (tab.discarded) return 2.5;
   let mb = 32.0 + (heapUsedMB || 0);
   if (tab.status === "loading") mb += 20.0;
@@ -48,6 +114,10 @@ function estimateTabFootprintMB(tab, heapUsedMB) {
 }
 
 async function buildTelemetryMessage() {
+  const now = Date.now();
+  const dtSec = Math.max(0.25, (now - lastTelemetryTime) / 1000);
+  lastTelemetryTime = now;
+
   const [tabs, windows] = await Promise.all([
     chrome.tabs.query({}),
     chrome.windows.getAll({})
@@ -58,27 +128,55 @@ async function buildTelemetryMessage() {
   let mutedCount = 0;
   let discardedCount = 0;
   let pinnedCount = 0;
+  let totalCPU = 0;
+  let totalNetRate = 0;
   let totalJSHeapMB = 0;
   let totalEstMB = 0;
 
   const formattedTabs = await Promise.all(
     tabs.map(async (tab) => {
       const muted = Boolean(tab.mutedInfo && tab.mutedInfo.muted);
-      const metrics = await queryPageMetrics(tab);
-      const estMB = estimateTabFootprintMB(tab, metrics.jsHeapUsedMb);
+      const pageMetrics = await queryPageMetrics(tab);
+      const nativeProc = nativeProcessMap.get(tab.id);
+
+      const processId = nativeProc ? nativeProc.processId : 0;
+      const cpuPercent = nativeProc && nativeProc.cpuPercent > 0
+        ? nativeProc.cpuPercent
+        : (pageMetrics.cpuPercent || (tab.status === "loading" ? 8.5 : (tab.audible && !muted ? 4.2 : 0)));
+
+      const trackedNet = Math.max(
+        tabNetworkBytes.get(tab.id) || 0,
+        pageMetrics.resourceTransferBytes || 0
+      );
+      const prevNet = tabPrevNetSnapshot.get(tab.id) || trackedNet;
+      tabPrevNetSnapshot.set(tab.id, trackedNet);
+
+      const netRate = nativeProc && nativeProc.networkBytesPerSec > 0
+        ? nativeProc.networkBytesPerSec
+        : Math.max(0, (trackedNet - prevNet) / dtSec);
+
+      const estMB = estimateTabFootprintMB(
+        tab,
+        pageMetrics.jsHeapUsedMb,
+        nativeProc ? nativeProc.memoryBytes : 0
+      );
 
       if (tab.active) activeCount++;
       if (tab.audible && !muted) audibleCount++;
       if (muted) mutedCount++;
       if (tab.discarded) discardedCount++;
       if (tab.pinned) pinnedCount++;
-      totalJSHeapMB += metrics.jsHeapUsedMb || 0;
+
+      totalCPU += cpuPercent;
+      totalNetRate += netRate;
+      totalJSHeapMB += pageMetrics.jsHeapUsedMb || 0;
       totalEstMB += estMB;
 
       return {
         id: tab.id,
         windowId: tab.windowId,
         index: tab.index,
+        processId,
         title: tab.title || "(Untitled Tab)",
         url: tab.url || "",
         status: tab.status || "complete",
@@ -88,9 +186,12 @@ async function buildTelemetryMessage() {
         muted,
         discarded: Boolean(tab.discarded),
         autoDiscardable: Boolean(tab.autoDiscardable),
-        jsHeapUsedMb: metrics.jsHeapUsedMb || 0,
-        jsHeapTotalMb: metrics.jsHeapTotalMb || 0,
-        domNodes: metrics.domNodes || 0,
+        cpuPercent: Number(cpuPercent.toFixed(1)),
+        netBytesPerSec: Number(netRate.toFixed(1)),
+        netTotalBytes: trackedNet,
+        jsHeapUsedMb: pageMetrics.jsHeapUsedMb || 0,
+        jsHeapTotalMb: pageMetrics.jsHeapTotalMb || 0,
+        domNodes: pageMetrics.domNodes || 0,
         estimatedMb: estMB
       };
     })
@@ -98,8 +199,9 @@ async function buildTelemetryMessage() {
 
   return {
     type: "TELEMETRY",
-    sentAt: Date.now(),
+    sentAt: now,
     summary: {
+      mode: "EXTENSION",
       totalTabs: tabs.length,
       totalWindows: windows.length,
       activeTabs: activeCount,
@@ -107,6 +209,8 @@ async function buildTelemetryMessage() {
       mutedTabs: mutedCount,
       discardedTabs: discardedCount,
       pinnedTabs: pinnedCount,
+      totalCpuPercent: Number(totalCPU.toFixed(1)),
+      totalNetBytesPerSec: Number(totalNetRate.toFixed(1)),
       totalJsHeapMb: Number(totalJSHeapMB.toFixed(1)),
       estimatedTotalMb: Number(totalEstMB.toFixed(1)),
       userAgent: navigator.userAgent,
@@ -148,6 +252,8 @@ async function runCommand(cmd) {
 
       case "CLOSE":
         pageMetricsCache.delete(tabId);
+        tabNetworkBytes.delete(tabId);
+        tabPrevNetSnapshot.delete(tabId);
         await chrome.tabs.remove(tabId);
         sendAck(requestId, true, `Closed tab ${tabId}`);
         break;
@@ -267,6 +373,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.tabs.onCreated.addListener(pushTelemetry);
 chrome.tabs.onRemoved.addListener((tabId) => {
   pageMetricsCache.delete(tabId);
+  tabNetworkBytes.delete(tabId);
+  tabPrevNetSnapshot.delete(tabId);
   pushTelemetry();
 });
 chrome.tabs.onUpdated.addListener((_, info) => {
@@ -282,4 +390,5 @@ chrome.tabs.onUpdated.addListener((_, info) => {
   }
 });
 
+initNativeProcessMonitor();
 connectSocket();

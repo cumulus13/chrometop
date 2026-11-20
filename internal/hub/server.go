@@ -22,11 +22,17 @@ const (
 	maxFrameBytes = 4 * 1024 * 1024
 )
 
-// Server manages the WebSocket connection from the Chrome extension and stores live telemetry.
+// CommandDispatcher defines an optional external backend (such as CDP mode) for commands.
+type CommandDispatcher interface {
+	Dispatch(cmd protocol.CommandMsg) error
+}
+
+// Server manages WebSocket telemetry from the Chrome extension or direct CDP state updates.
 type Server struct {
 	mu           sync.RWMutex
 	writeMu      sync.Mutex
 	conn         *websocket.Conn
+	mode         string
 	connected    bool
 	peerAddr     string
 	lastSync     time.Time
@@ -34,6 +40,7 @@ type Server struct {
 	tabs         []protocol.TabInfo
 	lastEventLog string
 	token        string
+	dispatcher   CommandDispatcher
 	upgrader     websocket.Upgrader
 	onChange     func()
 }
@@ -41,6 +48,7 @@ type Server struct {
 // New constructs a new WebSocket hub.
 func New(token string, onChange func()) *Server {
 	return &Server{
+		mode:     "EXTENSION",
 		token:    token,
 		onChange: onChange,
 		upgrader: websocket.Upgrader{
@@ -52,6 +60,31 @@ func New(token string, onChange func()) *Server {
 			},
 		},
 	}
+}
+
+// SetDispatcher configures a custom command backend (used in direct CDP mode).
+func (s *Server) SetDispatcher(mode string, d CommandDispatcher) {
+	s.mu.Lock()
+	s.mode = mode
+	s.dispatcher = d
+	s.mu.Unlock()
+}
+
+// UpdateDirectState updates state directly from an internal collector (such as CDP poller).
+func (s *Server) UpdateDirectState(connected bool, peer string, summary protocol.Summary, tabs []protocol.TabInfo, eventLog string) {
+	s.mu.Lock()
+	s.connected = connected
+	s.peerAddr = peer
+	s.summary = summary
+	s.tabs = tabs
+	if connected {
+		s.lastSync = time.Now()
+	}
+	if eventLog != "" {
+		s.lastEventLog = eventLog
+	}
+	s.mu.Unlock()
+	s.emitChange()
 }
 
 // HandleWS upgrades HTTP requests from the Chrome extension to a WebSocket session.
@@ -97,6 +130,7 @@ func (s *Server) attach(conn *websocket.Conn, peer string) {
 		_ = s.conn.Close()
 	}
 	s.conn = conn
+	s.mode = "EXTENSION"
 	s.connected = true
 	s.peerAddr = peer
 	s.lastEventLog = fmt.Sprintf("🟢 Extension connected from %s", peer)
@@ -152,6 +186,9 @@ func (s *Server) consumeFrame(raw []byte) {
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			return
 		}
+		if msg.Summary.Mode == "" {
+			msg.Summary.Mode = "EXTENSION"
+		}
 		s.mu.Lock()
 		s.summary = msg.Summary
 		s.tabs = msg.Tabs
@@ -175,12 +212,17 @@ func (s *Server) consumeFrame(raw []byte) {
 	}
 }
 
-// SendCommand transmits a control command to the connected Chrome extension.
+// SendCommand transmits a control command to the active backend (CDP dispatcher or Chrome extension).
 func (s *Server) SendCommand(cmd protocol.CommandMsg) error {
 	s.mu.RLock()
+	disp := s.dispatcher
 	conn := s.conn
 	ok := s.connected
 	s.mu.RUnlock()
+
+	if disp != nil {
+		return disp.Dispatch(cmd)
+	}
 
 	if !ok || conn == nil {
 		return errors.New("no active Chrome extension WebSocket connection")
@@ -214,6 +256,7 @@ func (s *Server) Snapshot() protocol.Snapshot {
 	copy(tabs, s.tabs)
 
 	return protocol.Snapshot{
+		Mode:         s.mode,
 		Connected:    s.connected,
 		PeerAddr:     s.peerAddr,
 		LastSync:     s.lastSync,

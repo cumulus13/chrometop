@@ -17,27 +17,38 @@ import (
 // TickMsg triggers periodic TUI updates.
 type TickMsg struct{}
 
-type sortMode int
+type sortField int
 
 const (
-	sortFootprint sortMode = iota
+	sortCPU sortField = iota
+	sortNet
+	sortFootprint
 	sortJSHeap
+	sortPID
 	sortTabID
 	sortTitle
 )
 
-func (m sortMode) label() string {
-	switch m {
+const sortFieldCount = 7
+
+func (s sortField) label() string {
+	switch s {
+	case sortCPU:
+		return "CPU%"
+	case sortNet:
+		return "NET/S"
 	case sortFootprint:
 		return "EST-MB"
 	case sortJSHeap:
 		return "JS-HEAP"
+	case sortPID:
+		return "PID"
 	case sortTabID:
 		return "TAB-ID"
 	case sortTitle:
 		return "TITLE"
 	default:
-		return "EST-MB"
+		return "CPU%"
 	}
 }
 
@@ -56,6 +67,12 @@ var (
 			Bold(true).
 			Foreground(lipgloss.Color("#0B0F17")).
 			Background(lipgloss.Color("#00E5FF")).
+			Padding(0, 1)
+
+	modeBadgeStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#0B0F17")).
+			Background(lipgloss.Color("#BD93F9")).
 			Padding(0, 1)
 
 	onlineStyle = lipgloss.NewStyle().
@@ -100,12 +117,13 @@ var (
 // Model is the Bubble Tea model for ChromeTop.
 type Model struct {
 	hub        *hub.Server
-	bindAddr   string
+	endpoint   string
 	width      int
 	height     int
 	cursor     int
 	scroll     int
-	sort       sortMode
+	sortBy     sortField
+	sortAsc    bool
 	filtering  bool
 	filterText string
 	inspecting bool
@@ -113,13 +131,14 @@ type Model struct {
 }
 
 // NewModel initializes a ChromeTop TUI model.
-func NewModel(h *hub.Server, bindAddr string) Model {
+func NewModel(h *hub.Server, endpoint string) Model {
 	return Model{
 		hub:      h,
-		bindAddr: bindAddr,
-		width:    130,
+		endpoint: endpoint,
+		width:    136,
 		height:   34,
-		sort:     sortFootprint,
+		sortBy:   sortCPU,
+		sortAsc:  false,
 	}
 }
 
@@ -207,41 +226,43 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = 0
 		m.scroll = 0
 	case "s":
-		m.sort = (m.sort + 1) % 4
+		m.sortBy = (m.sortBy + 1) % sortFieldCount
+	case "o", "S":
+		m.sortAsc = !m.sortAsc
 	case "i":
 		if _, ok := m.currentTab(list); ok {
 			m.inspecting = true
 		}
 	case "enter", "f":
 		if t, ok := m.currentTab(list); ok {
-			m.send("FOCUS", t.ID, t.WindowID, "")
+			m.send("FOCUS", t)
 		}
 	case "x", "delete":
 		if t, ok := m.currentTab(list); ok {
-			m.send("CLOSE", t.ID, t.WindowID, "")
+			m.send("CLOSE", t)
 		}
 	case "r":
 		if t, ok := m.currentTab(list); ok {
-			m.send("RELOAD", t.ID, t.WindowID, "")
+			m.send("RELOAD", t)
 		}
 	case "d":
 		if t, ok := m.currentTab(list); ok {
-			m.send("DISCARD", t.ID, t.WindowID, "")
+			m.send("DISCARD", t)
 		}
 	case "m":
 		if t, ok := m.currentTab(list); ok {
-			m.send("MUTE", t.ID, t.WindowID, "")
+			m.send("MUTE", t)
 		}
 	case "p":
 		if t, ok := m.currentTab(list); ok {
-			m.send("PIN", t.ID, t.WindowID, "")
+			m.send("PIN", t)
 		}
 	case "c":
 		if t, ok := m.currentTab(list); ok {
-			m.send("DUPLICATE", t.ID, t.WindowID, "")
+			m.send("DUPLICATE", t)
 		}
 	case "n":
-		m.send("NEW_TAB", 0, 0, "https://example.com")
+		m.sendURL("NEW_TAB", "https://example.com")
 	case "y":
 		if t, ok := m.currentTab(list); ok {
 			if err := copyToClipboard(t.URL); err != nil {
@@ -251,27 +272,41 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "R":
-		m.send("SYNC", 0, 0, "")
+		m.sendURL("SYNC", "")
 	}
 
 	m.clampScroll(len(list))
 	return m, nil
 }
 
-func (m *Model) send(action string, tabID, winID int, url string) {
+func (m *Model) send(action string, t protocol.TabInfo) {
 	cmd := protocol.CommandMsg{
 		Type:      "COMMAND",
 		Action:    action,
-		TabID:     tabID,
-		WindowID:  winID,
-		URL:       url,
+		TabID:     t.ID,
+		TargetID:  t.TargetID,
+		WindowID:  t.WindowID,
 		RequestID: fmt.Sprintf("cmd-%d", time.Now().UnixNano()),
 	}
 	if err := m.hub.SendCommand(cmd); err != nil {
 		m.banner = fmt.Sprintf("⚠️ %s", err.Error())
 		return
 	}
-	m.banner = fmt.Sprintf("🚀 Dispatched %s → tab %d", action, tabID)
+	m.banner = fmt.Sprintf("🚀 Dispatched %s → tab %d", action, t.ID)
+}
+
+func (m *Model) sendURL(action, targetURL string) {
+	cmd := protocol.CommandMsg{
+		Type:      "COMMAND",
+		Action:    action,
+		URL:       targetURL,
+		RequestID: fmt.Sprintf("cmd-%d", time.Now().UnixNano()),
+	}
+	if err := m.hub.SendCommand(cmd); err != nil {
+		m.banner = fmt.Sprintf("⚠️ %s", err.Error())
+		return
+	}
+	m.banner = fmt.Sprintf("🚀 Dispatched %s", action)
 }
 
 func (m Model) currentTab(tabs []protocol.TabInfo) (protocol.TabInfo, bool) {
@@ -324,59 +359,97 @@ func (m Model) filteredSortedTabs() []protocol.TabInfo {
 	}
 
 	sort.SliceStable(out, func(i, j int) bool {
-		switch m.sort {
+		var less bool
+		var equal bool
+
+		switch m.sortBy {
+		case sortCPU:
+			equal = out[i].CPUPercent == out[j].CPUPercent
+			less = out[i].CPUPercent < out[j].CPUPercent
+		case sortNet:
+			equal = out[i].NetBytesPerSec == out[j].NetBytesPerSec
+			less = out[i].NetBytesPerSec < out[j].NetBytesPerSec
 		case sortFootprint:
-			if out[i].EstimatedMB != out[j].EstimatedMB {
-				return out[i].EstimatedMB > out[j].EstimatedMB
-			}
-			return out[i].ID < out[j].ID
+			equal = out[i].EstimatedMB == out[j].EstimatedMB
+			less = out[i].EstimatedMB < out[j].EstimatedMB
 		case sortJSHeap:
-			if out[i].JSHeapUsedMB != out[j].JSHeapUsedMB {
-				return out[i].JSHeapUsedMB > out[j].JSHeapUsedMB
-			}
-			return out[i].ID < out[j].ID
+			equal = out[i].JSHeapUsedMB == out[j].JSHeapUsedMB
+			less = out[i].JSHeapUsedMB < out[j].JSHeapUsedMB
+		case sortPID:
+			equal = out[i].ProcessID == out[j].ProcessID
+			less = out[i].ProcessID < out[j].ProcessID
 		case sortTitle:
-			return strings.ToLower(out[i].Title) < strings.ToLower(out[j].Title)
+			a := strings.ToLower(out[i].Title)
+			b := strings.ToLower(out[j].Title)
+			equal = a == b
+			less = a < b
 		default:
+			equal = out[i].ID == out[j].ID
+			less = out[i].ID < out[j].ID
+		}
+
+		if equal {
 			return out[i].ID < out[j].ID
 		}
+		if m.sortAsc {
+			return less
+		}
+		return !less
 	})
 
 	return out
 }
 
+func (m Model) sortDirectionArrow() string {
+	if m.sortAsc {
+		return "▲ ASC"
+	}
+	return "▼ DESC"
+}
+
 func (m Model) View() string {
 	snap := m.hub.Snapshot()
 	tabs := m.filteredSortedTabs()
-	w := maxVal(60, m.width)
+	w := maxVal(72, m.width)
 
 	connBadge := offlineStyle.Render("🔴 OFFLINE")
 	if snap.Connected {
 		connBadge = onlineStyle.Render("🟢 ONLINE")
 	}
 
-	meter := renderBar(snap.Summary.EstimatedTotal, 2048, 18)
+	modeText := snap.Mode
+	if modeText == "" {
+		modeText = "EXTENSION"
+	}
+
+	cpuMeter := renderBar(snap.Summary.TotalCPUPerc, 100.0, 14)
+	memMeter := renderBar(snap.Summary.EstimatedTotal, 2048.0, 14)
+
 	syncTime := "never"
 	if !snap.LastSync.IsZero() {
 		syncTime = snap.LastSync.Format("15:04:05")
 	}
 
 	line1 := fmt.Sprintf(
-		"%s %s  🔌 ws://%s/ws  |  🔀 Sort: %s  |  📑 Tabs: %d  🪟 Win: %d  🔊 %d  💤 %d",
+		"%s %s %s  🔌 %s  |  🔀 Sort: %s (%s)  |  📑 Tabs: %d  🔊 %d  💤 %d",
 		brandStyle.Render("⚡ CHROMETOP"),
+		modeBadgeStyle.Render(modeText),
 		connBadge,
-		m.bindAddr,
-		m.sort.label(),
+		m.endpoint,
+		m.sortBy.label(),
+		m.sortDirectionArrow(),
 		snap.Summary.TotalTabs,
-		snap.Summary.TotalWindows,
 		snap.Summary.AudibleTabs,
 		snap.Summary.DiscardedTabs,
 	)
 
 	line2 := fmt.Sprintf(
-		"📊 Footprint: %s %.1f MB  |  🧠 JS Heap: %.1f MB  |  🕒 Sync: %s",
-		meter,
+		"🔥 CPU: %s %5.1f%%  |  📊 Mem: %s %.1f MB  |  🌐 Net: %s/s  |  🧠 Heap: %.1f MB  |  🕒 %s",
+		cpuMeter,
+		snap.Summary.TotalCPUPerc,
+		memMeter,
 		snap.Summary.EstimatedTotal,
+		formatBytes(snap.Summary.TotalNetRate),
 		snap.Summary.TotalJSHeapMB,
 		syncTime,
 	)
@@ -386,20 +459,21 @@ func (m Model) View() string {
 	if m.inspecting {
 		if sel, ok := m.currentTab(tabs); ok {
 			detail := strings.Join([]string{
-				fmt.Sprintf("🔎 TAB INSPECTOR — ID %d (Window %d, Index %d)", sel.ID, sel.WindowID, sel.Index),
+				fmt.Sprintf("🔎 TAB INSPECTOR — ID %d (Window %d, PID %d, Target %s)", sel.ID, sel.WindowID, sel.ProcessID, fallbackStr(sel.TargetID, "n/a")),
 				fmt.Sprintf("📌 Title     : %s", sel.Title),
 				fmt.Sprintf("🔗 URL       : %s", sel.URL),
 				fmt.Sprintf("⚡ Status    : %s | Active=%v | Pinned=%v | Discarded=%v", sel.Status, sel.Active, sel.Pinned, sel.Discarded),
-				fmt.Sprintf("🔊 Audio     : Audible=%v | Muted=%v", sel.Audible, sel.Muted),
+				fmt.Sprintf("🔥 CPU       : %.1f%%", sel.CPUPercent),
+				fmt.Sprintf("🌐 Network   : %s/s (Total transferred: %s)", formatBytes(sel.NetBytesPerSec), formatBytes(float64(sel.NetTotalBytes))),
 				fmt.Sprintf("🧠 JS Heap   : %.2f MB / %.2f MB used/total | DOM Nodes: %d", sel.JSHeapUsedMB, sel.JSHeapTotalMB, sel.DOMNodes),
-				fmt.Sprintf("📊 Est. Foot : %.1f MB", sel.EstimatedMB),
+				fmt.Sprintf("📊 Est. Mem  : %.1f MB", sel.EstimatedMB),
 				dimStyle.Render("Press [Esc] / [i] / [Enter] to return to table"),
 			}, "\n")
 			return inspectorStyle.Width(w - 2).Render(detail)
 		}
 	}
 
-	filterRow := dimStyle.Render("🔎 Press '/' to filter by title or URL")
+	filterRow := dimStyle.Render("🔎 Press '/' to filter  |  [s] Cycle Sort Column  |  [o] Toggle ASC ▲ / DESC ▼")
 	if m.filtering || m.filterText != "" {
 		caret := ""
 		if m.filtering {
@@ -410,14 +484,25 @@ func (m Model) View() string {
 
 	titleW, urlW := m.calcCols(w)
 	hdr := colHeaderStyle.Width(w).Render(
-		fmt.Sprintf(" %-6s %-4s %-7s %-8s %-9s %-*s %-*s", "TAB", "WIN", "STATE", "JS-HEAP", "EST-MB", titleW, "TITLE", urlW, "URL"),
+		fmt.Sprintf(
+			" %-5s %-6s %-6s %-7s %-9s %-8s %-8s %-*s %-*s",
+			m.colLabel(sortTabID, "TAB"),
+			m.colLabel(sortPID, "PID"),
+			"STATE",
+			m.colLabel(sortCPU, "CPU%"),
+			m.colLabel(sortNet, "NET/S"),
+			m.colLabel(sortJSHeap, "HEAP"),
+			m.colLabel(sortFootprint, "MEM"),
+			titleW, m.colLabel(sortTitle, "TITLE"),
+			urlW, "URL",
+		),
 	)
 
 	maxRows := m.visibleRows()
 	var body []string
 
 	if len(tabs) == 0 {
-		msg := fmt.Sprintf("⏳ Waiting for Chrome extension on ws://%s/ws ...", m.bindAddr)
+		msg := fmt.Sprintf("⏳ Waiting for Chrome/Chromium telemetry on %s ...", m.endpoint)
 		if snap.Connected {
 			msg = "📭 No matching tabs found."
 		}
@@ -451,7 +536,7 @@ func (m Model) View() string {
 	}
 
 	keys := strings.Join([]string{
-		keyCapStyle.Render("↑/↓") + " Move",
+		keyCapStyle.Render("↑/↓") + " Nav",
 		keyCapStyle.Render("Enter") + " Focus",
 		keyCapStyle.Render("i") + " Inspect",
 		keyCapStyle.Render("r") + " Reload",
@@ -460,9 +545,10 @@ func (m Model) View() string {
 		keyCapStyle.Render("p") + " Pin",
 		keyCapStyle.Render("c") + " Dup",
 		keyCapStyle.Render("n") + " New",
-		keyCapStyle.Render("y") + " CopyURL",
+		keyCapStyle.Render("y") + " Copy",
 		keyCapStyle.Render("x") + " Close",
-		keyCapStyle.Render("s") + " Sort",
+		keyCapStyle.Render("s") + " SortCol",
+		keyCapStyle.Render("o") + " Asc/Desc",
 		keyCapStyle.Render("/") + " Filter",
 		keyCapStyle.Render("q") + " Quit",
 	}, " ")
@@ -478,6 +564,16 @@ func (m Model) View() string {
 		strings.Join(body, "\n"),
 		bottomPanel,
 	}, "\n")
+}
+
+func (m Model) colLabel(field sortField, base string) string {
+	if m.sortBy != field {
+		return base
+	}
+	if m.sortAsc {
+		return base + "▲"
+	}
+	return base + "▼"
 }
 
 func renderTabLine(t protocol.TabInfo, titleW, urlW int) string {
@@ -501,16 +597,26 @@ func renderTabLine(t protocol.TabInfo, titleW, urlW int) string {
 	}
 	stateCol := icon + badge
 
+	pidStr := "-"
+	if t.ProcessID > 0 {
+		pidStr = fmt.Sprintf("%d", t.ProcessID)
+	}
+
+	cpuStr := fmt.Sprintf("%5.1f%%", t.CPUPercent)
+	netStr := formatBytes(t.NetBytesPerSec) + "/s"
+
 	heapStr := "-"
 	if t.JSHeapUsedMB > 0 {
 		heapStr = fmt.Sprintf("%.1fM", t.JSHeapUsedMB)
 	}
 
 	return fmt.Sprintf(
-		" %-6d %-4d %-7s %-8s %7.1fM  %-*s %-*s",
+		" %-5d %-6s %-6s %-7s %-9s %-8s %7.1fM %-*s %-*s",
 		t.ID,
-		t.WindowID,
+		pidStr,
 		stateCol,
+		cpuStr,
+		netStr,
 		heapStr,
 		t.EstimatedMB,
 		titleW, clipText(t.Title, titleW),
@@ -519,7 +625,7 @@ func renderTabLine(t protocol.TabInfo, titleW, urlW int) string {
 }
 
 func (m Model) calcCols(totalW int) (int, int) {
-	overhead := 42
+	overhead := 58
 	avail := totalW - overhead
 	if avail < 24 {
 		return 12, 12
@@ -527,6 +633,23 @@ func (m Model) calcCols(totalW int) (int, int) {
 	titleW := (avail * 45) / 100
 	urlW := avail - titleW
 	return titleW, urlW
+}
+
+func formatBytes(bps float64) string {
+	if bps <= 0 {
+		return "0B"
+	}
+	units := []string{"B", "KB", "MB", "GB"}
+	idx := 0
+	val := bps
+	for val >= 1024 && idx < len(units)-1 {
+		val /= 1024
+		idx++
+	}
+	if idx == 0 {
+		return fmt.Sprintf("%.0fB", val)
+	}
+	return fmt.Sprintf("%.1f%s", val, units[idx])
 }
 
 func renderBar(current, scaleMax float64, width int) string {
@@ -567,6 +690,13 @@ func clipText(s string, maxChars int) string {
 		return "…"
 	}
 	return string(r[:maxChars-1]) + "…"
+}
+
+func fallbackStr(v, def string) string {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
 }
 
 func copyToClipboard(text string) error {

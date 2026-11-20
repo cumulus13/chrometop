@@ -9,33 +9,46 @@ import (
 	"github.com/cumulus13/chrometop/internal/protocol"
 )
 
-func TestFilterAndSortInTUI(t *testing.T) {
+func TestFilterAndSortOrderToggleInTUI(t *testing.T) {
 	h := hub.New("", nil)
-	h.SetStatusBanner("ready")
+	h.UpdateDirectState(true, "127.0.0.1:9222", protocol.Summary{
+		Mode:      "CDP",
+		TotalTabs: 2,
+	}, []protocol.TabInfo{
+		{ID: 1, Title: "Alpha", CPUPercent: 5.0, NetBytesPerSec: 1000, EstimatedMB: 40},
+		{ID: 2, Title: "Beta", CPUPercent: 25.0, NetBytesPerSec: 5000, EstimatedMB: 80},
+	}, "ready")
 
-	m := NewModel(h, "127.0.0.1:9333")
+	m := NewModel(h, "http://127.0.0.1:9222")
 	m.width = 140
 	m.height = 36
 
-	nextModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
-	m = nextModel.(Model)
-	if !m.filtering {
-		t.Fatal("expected filtering mode to be active after pressing '/'")
+	// Default sort is CPU DESC -> Beta (25%) first
+	tabs := m.filteredSortedTabs()
+	if len(tabs) != 2 || tabs[0].ID != 2 {
+		t.Fatalf("expected tab 2 first on CPU DESC, got %+v", tabs)
 	}
 
-	nextModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("github")})
+	// Press 'o' to toggle ASC -> Alpha (5%) first
+	nextModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
 	m = nextModel.(Model)
-	nextModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	m = nextModel.(Model)
+	if !m.sortAsc {
+		t.Fatal("expected sortAsc=true after pressing 'o'")
+	}
+	tabs = m.filteredSortedTabs()
+	if tabs[0].ID != 1 {
+		t.Fatalf("expected tab 1 first on CPU ASC, got %+v", tabs)
+	}
 
-	if m.filterText != "github" || m.filtering {
-		t.Fatalf("unexpected filter state: text=%q filtering=%v", m.filterText, m.filtering)
+	// Press 's' to cycle sort field to NET/S
+	nextModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	m = nextModel.(Model)
+	if m.sortBy != sortNet {
+		t.Fatalf("expected sortNet after pressing 's', got %v", m.sortBy)
 	}
 
 	view := m.View()
-	if !strings.Contains(view, "CHROMETOP") {
-		t.Fatalf("expected TUI view to render CHROMETOP header")
+	if !strings.Contains(view, "CHROMETOP") || !strings.Contains(view, "NET/S▲") {
+		t.Fatalf("expected header with NET/S▲ indicator")
 	}
-
-	_ = protocol.TabInfo{}
 }
