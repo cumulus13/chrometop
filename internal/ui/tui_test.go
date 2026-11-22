@@ -111,20 +111,29 @@ func TestViewFillsTerminalExactly(t *testing.T) {
 }
 
 func TestFooterIsOnLastRow(t *testing.T) {
-	h := hub.New("", nil)
-	h.UpdateDirectState(true, "x", protocol.Summary{Mode: "CDP"}, makeTabs(3), "ready")
+	// The footer is the status line followed by the key hints. The last
+	// terminal row must always be the last hint line, whatever the width.
+	for _, width := range []int{80, 140, 220} {
+		h := hub.New("", nil)
+		h.UpdateDirectState(true, "x", protocol.Summary{Mode: "CDP"}, makeTabs(3), "ready")
 
-	m := NewModel(h, "x")
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
-	m = next.(Model)
+		m := NewModel(h, "x")
+		next, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: 40})
+		m = next.(Model)
 
-	lines := strings.Split(m.View(), "\n")
-	if len(lines) != 40 {
-		t.Fatalf("expected 40 lines, got %d", len(lines))
-	}
-	// With 140 columns every hint fits on one line, so the last row is the hints.
-	if !strings.Contains(lines[len(lines)-1], "Quit") {
-		t.Fatalf("expected key hints on the last terminal row, got %q", lines[len(lines)-1])
+		lines := strings.Split(m.View(), "\n")
+		if len(lines) != 40 {
+			t.Fatalf("width %d: expected 40 lines, got %d", width, len(lines))
+		}
+
+		// hintLines(width) are the last rows; the first one starts with "Nav".
+		firstHint := lines[len(lines)-len(hintLines(width))]
+		if !strings.Contains(firstHint, "Nav") {
+			t.Fatalf("width %d: key hints are not at the bottom of the screen, got %q", width, firstHint)
+		}
+		if strings.TrimSpace(lines[len(lines)-1]) == "" {
+			t.Fatalf("width %d: last terminal row is empty, expected the footer", width)
+		}
 	}
 }
 
