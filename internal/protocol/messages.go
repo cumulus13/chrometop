@@ -74,6 +74,9 @@ type AckMsg struct {
 
 // Snapshot provides a safe, immutable view of the current state for the TUI.
 type Snapshot struct {
+	// Revision increases on every state change. Consumers can use it to skip
+	// redundant work when nothing has changed since the previous snapshot.
+	Revision     uint64
 	Mode         string
 	Connected    bool
 	PeerAddr     string

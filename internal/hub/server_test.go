@@ -116,3 +116,43 @@ func TestUnauthorizedTokenRejected(t *testing.T) {
 		t.Fatalf("expected 401 unauthorized, got %d", resp.StatusCode)
 	}
 }
+
+func TestSubscribeCoalescesAndNeverBlocks(t *testing.T) {
+	s := New("", nil)
+	ch := s.Subscribe()
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 1000; i++ {
+			s.SetStatusBanner("tick")
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("producer blocked on a subscriber that never reads")
+	}
+
+	select {
+	case <-ch:
+	default:
+		t.Fatal("expected a pending change signal")
+	}
+	select {
+	case <-ch:
+		t.Fatal("signals must be coalesced into one")
+	default:
+	}
+}
+
+func TestSnapshotRevisionIncreases(t *testing.T) {
+	s := New("", nil)
+	before := s.Snapshot().Revision
+	s.SetStatusBanner("hello")
+	after := s.Snapshot().Revision
+	if after <= before {
+		t.Fatalf("expected revision to increase, got %d -> %d", before, after)
+	}
+}

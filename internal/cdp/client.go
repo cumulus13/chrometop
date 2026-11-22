@@ -1,3 +1,7 @@
+// Package cdp implements ChromeTop's direct Chrome DevTools Protocol backend.
+//
+// It polls /json/list for page targets, samples every page over a persistent
+// WebSocket and publishes one atomic state update per cycle to the hub.
 package cdp
 
 import (
@@ -14,7 +18,20 @@ import (
 
 	"github.com/cumulus13/chrometop/internal/hub"
 	"github.com/cumulus13/chrometop/internal/protocol"
-	"github.com/gorilla/websocket"
+)
+
+const (
+	// maxWorkers bounds the number of pages sampled in parallel.
+	maxWorkers = 8
+
+	// offlineAfterFailures is the number of consecutive failed polls after which
+	// the hub is switched to the offline state. Until then the last known tabs
+	// stay on screen so a single slow response does not blank the table.
+	offlineAfterFailures = 3
+
+	defaultSampleTimeout = 600 * time.Millisecond
+	defaultCycleBudget   = 2 * time.Second
+	versionTTL           = 5 * time.Minute
 )
 
 type cdpTarget struct {
@@ -32,44 +49,31 @@ type cdpVersion struct {
 	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
 }
 
-type persistentSession struct {
-	wsURL        string
-	conn         *websocket.Conn
-	writeMu      sync.Mutex
-	enabled      bool
-	lastCPUTime  float64
-	lastSampleAt time.Time
-	lastNetBytes uint64
-
-	// Cached last known metrics so UI never flickers to zero
-	cpuPercent  float64
-	netRate     float64
-	netTotal    uint64
-	heapUsedMB  float64
-	heapTotalMB float64
-	domNodes    int
-}
-
-func (s *persistentSession) close() {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.conn != nil {
-		_ = s.conn.Close()
-		s.conn = nil
-		s.enabled = false
-	}
-}
-
 // Client connects directly to Chromium/Chrome/Brave via --remote-debugging-port.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	hub        *hub.Server
 
-	mu       sync.Mutex
-	sessions map[string]*persistentSession
+	// sampleTimeout bounds the time spent on one page per cycle.
+	sampleTimeout time.Duration
+
+	// cycleBudget bounds the time spent sampling all pages in one cycle.
+	cycleBudget time.Duration
+
+	// kickCh asks the Run loop for an immediate refresh without blocking the caller.
+	kickCh chan struct{}
+
+	mu       sync.Mutex // guards sessions, tabIDs and nextID
+	sessions map[string]*session
 	tabIDs   map[string]int
 	nextID   int
+
+	// Poll-loop state. Only touched by the goroutine running pollOnce.
+	version   cdpVersion
+	versionAt time.Time
+	failures  int
+	online    bool
 }
 
 // NewClient initializes a direct CDP collector and command dispatcher.
@@ -79,33 +83,38 @@ func NewClient(baseURL string, h *hub.Server) *Client {
 		trimmed = "http://" + trimmed
 	}
 	return &Client{
-		baseURL: trimmed,
-		httpClient: &http.Client{
-			Timeout: 1200 * time.Millisecond,
-		},
-		hub:      h,
-		sessions: make(map[string]*persistentSession),
-		tabIDs:   make(map[string]int),
-		nextID:   1,
+		baseURL:       trimmed,
+		httpClient:    &http.Client{Timeout: 2 * time.Second},
+		hub:           h,
+		sampleTimeout: defaultSampleTimeout,
+		cycleBudget:   defaultCycleBudget,
+		kickCh:        make(chan struct{}, 1),
+		sessions:      make(map[string]*session),
+		tabIDs:        make(map[string]int),
+		nextID:        1,
 	}
 }
 
-// Run polls CDP /json/list and collects metrics over persistent per-page WebSockets.
+// Run polls CDP until ctx is cancelled. It is the only goroutine that runs
+// pollOnce, so cycles never overlap.
 func (c *Client) Run(ctx context.Context, interval time.Duration) {
-	if interval < 300*time.Millisecond {
-		interval = 1 * time.Second
+	if interval < 250*time.Millisecond {
+		interval = time.Second
 	}
+
+	// Let a cycle use about 1.5x the interval, but never less than the default
+	// budget so that slow machines still get a chance to finish a cycle.
+	budget := interval * 3 / 2
+	if budget < defaultCycleBudget {
+		budget = defaultCycleBudget
+	}
+	c.cycleBudget = budget
+
+	defer c.closeAll()
+
 	c.pollOnce(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	defer func() {
-		c.mu.Lock()
-		for _, s := range c.sessions {
-			s.close()
-		}
-		c.mu.Unlock()
-	}()
 
 	for {
 		select {
@@ -113,7 +122,25 @@ func (c *Client) Run(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			c.pollOnce(ctx)
+		case <-c.kickCh:
+			c.pollOnce(ctx)
 		}
+	}
+}
+
+// kick requests an immediate refresh. It never blocks.
+func (c *Client) kick() {
+	select {
+	case c.kickCh <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) closeAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, s := range c.sessions {
+		s.close()
 	}
 }
 
@@ -122,8 +149,14 @@ func (c *Client) pollOnce(ctx context.Context) {
 		return
 	}
 
-	ver, err := c.fetchVersion(ctx)
+	targets, err := c.fetchTargets(ctx)
 	if err != nil {
+		c.failures++
+		if c.failures < offlineAfterFailures {
+			c.hub.SetStatusBanner(fmt.Sprintf("⏳ CDP slow to respond (%d/%d): %v", c.failures, offlineAfterFailures, err))
+			return
+		}
+		c.online = false
 		c.hub.UpdateDirectState(
 			false,
 			c.baseURL,
@@ -133,18 +166,8 @@ func (c *Client) pollOnce(ctx context.Context) {
 		)
 		return
 	}
-
-	targets, err := c.fetchTargets(ctx)
-	if err != nil {
-		c.hub.UpdateDirectState(
-			false,
-			c.baseURL,
-			protocol.Summary{Mode: "CDP"},
-			nil,
-			fmt.Sprintf("🔴 CDP /json/list failed: %v", err),
-		)
-		return
-	}
+	c.failures = 0
+	ver := c.cachedVersion(ctx)
 
 	var pageTargets []cdpTarget
 	seen := make(map[string]bool)
@@ -155,7 +178,7 @@ func (c *Client) pollOnce(ctx context.Context) {
 		}
 	}
 
-	// Clean up closed tabs
+	// Drop sessions of closed tabs.
 	c.mu.Lock()
 	for id, sess := range c.sessions {
 		if !seen[id] {
@@ -166,8 +189,12 @@ func (c *Client) pollOnce(ctx context.Context) {
 	}
 	c.mu.Unlock()
 
+	// Sampling gets a hard time budget. Pages that do not answer in time keep
+	// showing their last known metrics instead of stalling the whole cycle.
+	cycleCtx, cancel := context.WithTimeout(ctx, c.cycleBudget)
+	defer cancel()
+
 	tabs := make([]protocol.TabInfo, len(pageTargets))
-	const maxWorkers = 8
 	sem := make(chan struct{}, maxWorkers)
 	var wg sync.WaitGroup
 
@@ -176,215 +203,81 @@ func (c *Client) pollOnce(ctx context.Context) {
 		sess := c.getOrCreateSession(tgt.ID, tgt.WebSocketDebuggerURL)
 
 		wg.Add(1)
-		go func(i int, id int, target cdpTarget, session *persistentSession, isFirst bool) {
+		go func(i, id int, target cdpTarget, s *session) {
 			defer wg.Done()
+
 			select {
 			case sem <- struct{}{}:
-				c.sampleSession(ctx, session)
+				s.sample(cycleCtx, c.sampleTimeout)
 				<-sem
-			case <-ctx.Done():
-				return
+			case <-cycleCtx.Done():
+				// Out of budget: fall through and report cached metrics.
 			}
 
-			estMB := 35.0 + session.heapUsedMB
-			if session.heapUsedMB == 0 {
-				estMB = 48.0
-			}
-
-			tabs[i] = protocol.TabInfo{
-				ID:             id,
-				TargetID:       target.ID,
-				WindowID:       1,
-				Index:          id, // Stable index prevents row jumping across polls
-				Title:          fallbackTitle(target.Title),
-				URL:            target.URL,
-				Status:         "complete",
-				Active:         isFirst,
-				CPUPercent:     round1(session.cpuPercent),
-				NetBytesPerSec: round1(session.netRate),
-				NetTotalBytes:  session.netTotal,
-				JSHeapUsedMB:   round2(session.heapUsedMB),
-				JSHeapTotalMB:  round2(session.heapTotalMB),
-				DOMNodes:       session.domNodes,
-				EstimatedMB:    round1(estMB),
-			}
-		}(idx, numericID, tgt, sess, idx == 0)
+			tabs[i] = buildTab(id, target, s.m, i == 0)
+		}(idx, numericID, tgt, sess)
 	}
 	wg.Wait()
 
-	// Keep deterministic base order by numeric tab ID so ties never shuffle rows
+	// Keep a deterministic base order by numeric tab ID so ties never shuffle rows.
 	sort.Slice(tabs, func(i, j int) bool {
 		return tabs[i].ID < tabs[j].ID
 	})
 
-	// Single atomic state update per cycle (eliminates visual flickering/rolling)
-	c.hub.UpdateDirectState(true, c.baseURL, c.buildSummary(ver, tabs), tabs, "")
+	eventLog := ""
+	if !c.online {
+		c.online = true
+		eventLog = fmt.Sprintf("🟢 Connected to %s", fallbackStr(ver.Browser, c.baseURL))
+	}
+
+	// Single atomic state update per cycle (eliminates visual flickering).
+	c.hub.UpdateDirectState(true, c.baseURL, c.buildSummary(ver, tabs), tabs, eventLog)
 }
 
-func (c *Client) getOrCreateSession(targetID, wsURL string) *persistentSession {
+func buildTab(id int, target cdpTarget, m metrics, first bool) protocol.TabInfo {
+	estMB := 35.0 + m.heapUsedMB
+	if m.heapUsedMB == 0 {
+		estMB = 48.0
+	}
+
+	return protocol.TabInfo{
+		ID:             id,
+		TargetID:       target.ID,
+		WindowID:       1,
+		Index:          id, // Stable index prevents row jumping across polls
+		Title:          fallbackTitle(target.Title),
+		URL:            target.URL,
+		Status:         "complete",
+		Active:         first,
+		CPUPercent:     round1(m.cpuPercent),
+		NetBytesPerSec: round1(m.netRate),
+		NetTotalBytes:  m.netTotal,
+		JSHeapUsedMB:   round2(m.heapUsedMB),
+		JSHeapTotalMB:  round2(m.heapTotalMB),
+		DOMNodes:       m.domNodes,
+		EstimatedMB:    round1(estMB),
+	}
+}
+
+func (c *Client) getOrCreateSession(targetID, wsURL string) *session {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if s, ok := c.sessions[targetID]; ok {
-		if wsURL != "" && s.wsURL != wsURL {
+		if wsURL != "" && s.url() != wsURL {
 			s.close()
-			s.wsURL = wsURL
+			s.setURL(wsURL)
 		}
 		return s
 	}
-	s := &persistentSession{wsURL: wsURL}
+	s := newSession(targetID, wsURL)
 	c.sessions[targetID] = s
 	return s
 }
 
-func (c *Client) sampleSession(ctx context.Context, s *persistentSession) {
-	if s.wsURL == "" {
-		return
-	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	if s.conn == nil {
-		dialCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-		dialer := websocket.Dialer{HandshakeTimeout: 250 * time.Millisecond}
-		conn, _, err := dialer.DialContext(dialCtx, s.wsURL, nil)
-		cancel()
-		if err != nil {
-			return
-		}
-		s.conn = conn
-		s.enabled = false
-	}
-
-	deadline := time.Now().Add(350 * time.Millisecond)
-	_ = s.conn.SetReadDeadline(deadline)
-	_ = s.conn.SetWriteDeadline(deadline)
-
-	if !s.enabled {
-		if err := s.conn.WriteJSON(map[string]any{"id": 1, "method": "Performance.enable"}); err != nil {
-			s.closeLocked()
-			return
-		}
-		s.enabled = true
-	}
-
-	if err := s.conn.WriteJSON(map[string]any{"id": 2, "method": "Performance.getMetrics"}); err != nil {
-		s.closeLocked()
-		return
-	}
-
-	if err := s.conn.WriteJSON(map[string]any{
-		"id":     3,
-		"method": "Runtime.evaluate",
-		"params": map[string]any{
-			"expression":    "(() => { try { return performance.getEntriesByType('resource').reduce((a, b) => a + (b.transferSize || 0), 0); } catch (e) { return 0; } })()",
-			"returnByValue": true,
-		},
-	}); err != nil {
-		s.closeLocked()
-		return
-	}
-
-	var taskDuration float64
-	var threadTime float64
-	gotMetrics := false
-	gotEval := false
-
-	for i := 0; i < 10 && (!gotMetrics || !gotEval); i++ {
-		_, raw, err := s.conn.ReadMessage()
-		if err != nil {
-			// Reset broken socket so next tick reconnects cleanly
-			s.closeLocked()
-			break
-		}
-		var env struct {
-			ID     int             `json:"id"`
-			Result json.RawMessage `json:"result"`
-		}
-		if err := json.Unmarshal(raw, &env); err != nil || env.ID == 0 {
-			continue
-		}
-
-		switch env.ID {
-		case 2:
-			var res struct {
-				Metrics []struct {
-					Name  string  `json:"name"`
-					Value float64 `json:"value"`
-				} `json:"metrics"`
-			}
-			if json.Unmarshal(env.Result, &res) == nil {
-				for _, m := range res.Metrics {
-					switch m.Name {
-					case "TaskDuration":
-						taskDuration = m.Value
-					case "ThreadTime":
-						threadTime = m.Value
-					case "JSHeapUsedSize":
-						s.heapUsedMB = m.Value / (1024 * 1024)
-					case "JSHeapTotalSize":
-						s.heapTotalMB = m.Value / (1024 * 1024)
-					case "Nodes":
-						s.domNodes = int(m.Value)
-					}
-				}
-				gotMetrics = true
-			}
-		case 3:
-			var evalRes struct {
-				Result struct {
-					Value float64 `json:"value"`
-				} `json:"result"`
-			}
-			if json.Unmarshal(env.Result, &evalRes) == nil {
-				if evalRes.Result.Value > 0 {
-					s.netTotal = uint64(evalRes.Result.Value)
-				}
-				gotEval = true
-			}
-		}
-	}
-
-	if !gotMetrics {
-		return
-	}
-
-	cpuClock := taskDuration
-	if cpuClock <= 0 && threadTime > 0 {
-		cpuClock = threadTime
-	}
-
-	now := time.Now()
-	if !s.lastSampleAt.IsZero() && cpuClock > 0 {
-		dt := now.Sub(s.lastSampleAt).Seconds()
-		if dt > 0.05 {
-			dCPU := cpuClock - s.lastCPUTime
-			if dCPU >= 0 {
-				pct := (dCPU / dt) * 100.0
-				if pct > 100.0 {
-					pct = 100.0
-				}
-				s.cpuPercent = pct
-			}
-			if s.netTotal >= s.lastNetBytes {
-				s.netRate = float64(s.netTotal-s.lastNetBytes) / dt
-			}
-		}
-	}
-
-	if cpuClock > 0 {
-		s.lastCPUTime = cpuClock
-	}
-	s.lastNetBytes = s.netTotal
-	s.lastSampleAt = now
-}
-
-func (s *persistentSession) closeLocked() {
-	if s.conn != nil {
-		_ = s.conn.Close()
-		s.conn = nil
-		s.enabled = false
-	}
+func (c *Client) lookupSession(targetID string) *session {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sessions[targetID]
 }
 
 func (c *Client) buildSummary(ver cdpVersion, tabs []protocol.TabInfo) protocol.Summary {
@@ -424,6 +317,18 @@ func (c *Client) numericIDFor(targetID string) int {
 	return id
 }
 
+// cachedVersion returns /json/version data, refreshing it only occasionally.
+func (c *Client) cachedVersion(ctx context.Context) cdpVersion {
+	if c.version.Browser != "" && time.Since(c.versionAt) < versionTTL {
+		return c.version
+	}
+	if v, err := c.fetchVersion(ctx); err == nil {
+		c.version = v
+		c.versionAt = time.Now()
+	}
+	return c.version
+}
+
 func (c *Client) fetchVersion(ctx context.Context) (cdpVersion, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/json/version", nil)
 	if err != nil {
@@ -461,6 +366,10 @@ func (c *Client) fetchTargets(ctx context.Context) ([]cdpTarget, error) {
 }
 
 // Dispatch executes tab control commands directly over Chromium CDP HTTP/WebSocket endpoints.
+//
+// It may block on network I/O for up to a couple of seconds, so callers must
+// not invoke it from a UI event loop. The TUI runs it inside a tea.Cmd. It never
+// polls synchronously: instead it asks the Run loop for a refresh via kick.
 func (c *Client) Dispatch(cmd protocol.CommandMsg) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -499,19 +408,15 @@ func (c *Client) Dispatch(cmd protocol.CommandMsg) error {
 		if targetURL == "" {
 			targetURL = "about:blank"
 		}
-		endpoint := "/json/new?" + url.QueryEscape(targetURL)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+endpoint, nil)
-		if err != nil {
+		if err := c.putEndpoint(ctx, "/json/new?"+url.QueryEscape(targetURL)); err != nil {
 			return err
 		}
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return err
-		}
-		_ = resp.Body.Close()
 		c.hub.SetStatusBanner("✅ CDP opened new tab")
 
 	case "RELOAD":
+		if targetID == "" {
+			return fmt.Errorf("missing targetId for RELOAD")
+		}
 		if err := c.sendPageCommand(ctx, targetID, "Page.reload", nil); err != nil {
 			return err
 		}
@@ -528,32 +433,34 @@ func (c *Client) Dispatch(cmd protocol.CommandMsg) error {
 		if pageURL == "" {
 			pageURL = "about:blank"
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+"/json/new?"+url.QueryEscape(pageURL), nil)
-		if err != nil {
+		if err := c.putEndpoint(ctx, "/json/new?"+url.QueryEscape(pageURL)); err != nil {
 			return err
 		}
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return err
-		}
-		_ = resp.Body.Close()
 		c.hub.SetStatusBanner(fmt.Sprintf("✅ CDP duplicated target %s", shortID(targetID)))
 
 	case "SYNC":
-		c.pollOnce(ctx)
-		c.hub.SetStatusBanner("✅ CDP telemetry synced")
+		c.kick()
+		c.hub.SetStatusBanner("✅ CDP telemetry sync requested")
 		return nil
 
 	default:
 		return fmt.Errorf("action %s is supported in Extension mode (CDP supports FOCUS, RELOAD, DUPLICATE, NEW_TAB, CLOSE, SYNC)", cmd.Action)
 	}
 
-	c.pollOnce(ctx)
+	c.kick()
 	return nil
 }
 
 func (c *Client) hitEndpoint(ctx context.Context, path string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	return c.doEndpoint(ctx, http.MethodGet, path)
+}
+
+func (c *Client) putEndpoint(ctx context.Context, path string) error {
+	return c.doEndpoint(ctx, http.MethodPut, path)
+}
+
+func (c *Client) doEndpoint(ctx context.Context, method, path string) error {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, nil)
 	if err != nil {
 		return err
 	}
@@ -569,37 +476,30 @@ func (c *Client) hitEndpoint(ctx context.Context, path string) error {
 	return nil
 }
 
+// sendPageCommand runs a CDP method on a page, reusing its persistent session
+// when one exists.
 func (c *Client) sendPageCommand(ctx context.Context, targetID, method string, params map[string]any) error {
-	targets, err := c.fetchTargets(ctx)
-	if err != nil {
-		return err
-	}
-	var wsURL string
-	for _, t := range targets {
-		if t.ID == targetID {
-			wsURL = t.WebSocketDebuggerURL
-			break
+	s := c.lookupSession(targetID)
+	if s == nil {
+		targets, err := c.fetchTargets(ctx)
+		if err != nil {
+			return err
 		}
-	}
-	if wsURL == "" {
-		return fmt.Errorf("target %s debugger URL not found", targetID)
+		var wsURL string
+		for _, t := range targets {
+			if t.ID == targetID {
+				wsURL = t.WebSocketDebuggerURL
+				break
+			}
+		}
+		if wsURL == "" {
+			return fmt.Errorf("target %s debugger URL not found", targetID)
+		}
+		s = c.getOrCreateSession(targetID, wsURL)
 	}
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_ = conn.SetWriteDeadline(time.Now().Add(600 * time.Millisecond))
-	msg := map[string]any{
-		"id":     1,
-		"method": method,
-	}
-	if params != nil {
-		msg["params"] = params
-	}
-	return conn.WriteJSON(msg)
+	_, err := s.call(ctx, method, params)
+	return err
 }
 
 func fallbackTitle(t string) string {
@@ -607,6 +507,13 @@ func fallbackTitle(t string) string {
 		return "(Untitled)"
 	}
 	return t
+}
+
+func fallbackStr(v, def string) string {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
 }
 
 func shortID(id string) string {

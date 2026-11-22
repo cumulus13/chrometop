@@ -57,5 +57,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ cpuPercent: 0, jsHeapUsedMb: 0, jsHeapTotalMb: 0, resourceTransferBytes: 0, domNodes: 0 });
     }
   }
-  return true;
+  // The response is sent synchronously, so the channel must not be kept open.
+  return false;
 });

@@ -1,9 +1,11 @@
-# Binaries & build artifacts
-chrometop
-chrometop.exe
-dist/
+# Binaries & build artifacts (anchored to the repo root so that the
+# cmd/chrometop/ source directory is NOT ignored)
+/chrometop
+/chrometop.exe
+/dist/
 *.out
 *.test
+coverage.out
 
 # Go workspace & vendor
 vendor/
@@ -21,5 +23,11 @@ Thumbs.db
 *.sublime-project
 *.sublime-workspace
 
-# Added entries (1 items)
+# Local tooling
 .pt/
+gitignore_backup/
+
+# Added entries (3 items)
+*.patch
+*.hdr
+*.msg

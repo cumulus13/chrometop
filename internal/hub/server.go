@@ -43,9 +43,15 @@ type Server struct {
 	dispatcher   CommandDispatcher
 	upgrader     websocket.Upgrader
 	onChange     func()
+	rev          uint64
+	subs         []chan struct{}
 }
 
 // New constructs a new WebSocket hub.
+//
+// onChange is an optional callback invoked after every state change. It runs on
+// the goroutine that produced the change, so it must be fast and must never
+// block. UI code should prefer Subscribe, which is coalescing and non-blocking.
 func New(token string, onChange func()) *Server {
 	return &Server{
 		mode:     "EXTENSION",
@@ -256,6 +262,7 @@ func (s *Server) Snapshot() protocol.Snapshot {
 	copy(tabs, s.tabs)
 
 	return protocol.Snapshot{
+		Revision:     s.rev,
 		Mode:         s.mode,
 		Connected:    s.connected,
 		PeerAddr:     s.peerAddr,
@@ -266,7 +273,34 @@ func (s *Server) Snapshot() protocol.Snapshot {
 	}
 }
 
+// Subscribe returns a channel that receives a signal whenever hub state changes.
+//
+// The channel has capacity 1 and signals are coalesced: if the consumer has not
+// yet drained the previous signal, the new one is dropped. Producers therefore
+// never block, no matter how slow the consumer is. After receiving a signal the
+// consumer should call Snapshot to read the latest state.
+func (s *Server) Subscribe() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	s.mu.Lock()
+	s.subs = append(s.subs, ch)
+	s.mu.Unlock()
+	return ch
+}
+
+// emitChange bumps the revision and notifies subscribers. It never blocks.
 func (s *Server) emitChange() {
+	s.mu.Lock()
+	s.rev++
+	subs := s.subs
+	s.mu.Unlock()
+
+	for _, ch := range subs {
+		select {
+		case ch <- struct{}{}:
+		default: // a signal is already pending; coalesce
+		}
+	}
+
 	if s.onChange != nil {
 		s.onChange()
 	}

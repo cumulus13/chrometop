@@ -220,13 +220,39 @@ async function buildTelemetryMessage() {
   };
 }
 
+// Tab events (title changes, loading state, ...) can fire in bursts. Each push
+// queries every tab, so pushes are coalesced: at most one runs at a time, at
+// most one more is queued behind it, and consecutive pushes are spaced by
+// MIN_PUSH_GAP_MS. This keeps the browser and the ChromeTop UI responsive.
+const MIN_PUSH_GAP_MS = 250;
+let pushInFlight = false;
+let pushQueued = false;
+let lastPushAt = 0;
+
 async function pushTelemetry() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (pushInFlight) {
+    pushQueued = true;
+    return;
+  }
+
+  pushInFlight = true;
   try {
+    const wait = MIN_PUSH_GAP_MS - (Date.now() - lastPushAt);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
     const msg = await buildTelemetryMessage();
     ws.send(JSON.stringify(msg));
+    lastPushAt = Date.now();
   } catch (err) {
     console.error("[ChromeTop] Failed to send telemetry:", err);
+  } finally {
+    pushInFlight = false;
+    if (pushQueued) {
+      pushQueued = false;
+      pushTelemetry();
+    }
   }
 }
 
